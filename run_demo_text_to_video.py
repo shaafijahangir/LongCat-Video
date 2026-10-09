@@ -25,7 +25,7 @@ def torch_gc():
 
 def generate(args):
     # case setup
-    prompt = "In a realistic photography style, a white boy around seven or eight years old sits on a park bench, wearing a light blue T-shirt, denim shorts, and white sneakers. He holds an ice cream cone with vanilla and chocolate flavors, and beside him is a medium-sized golden Labrador. Smiling, the boy offers the ice cream to the dog, who eagerly licks it with its tongue. The sun is shining brightly, and the background features a green lawn and several tall trees, creating a warm and loving scene."
+    prompt = "walking through a forest into a sunset over the ocean"
     negative_prompt = "Bright tones, overexposed, static, blurred details, subtitles, style, works, paintings, images, static, overall gray, worst quality, low quality, JPEG compression residue, ugly, incomplete, extra fingers, poorly drawn hands, poorly drawn faces, deformed, disfigured, misshapen limbs, fused fingers, still picture, messy background, three legs, many people in the background, walking backwards"
     spatial_refine_only = False 
 
@@ -35,26 +35,46 @@ def generate(args):
     enable_compile = args.enable_compile
 
     # prepare distributed environment
-    rank = int(os.environ['RANK'])
-    num_gpus = torch.cuda.device_count()
-    local_rank = rank % num_gpus
-    torch.cuda.set_device(local_rank)
-    dist.init_process_group(backend="nccl", timeout=datetime.timedelta(seconds=3600*24))
-    global_rank    = dist.get_rank()
-    num_processes  = dist.get_world_size()
+    rank = int(os.environ.get('RANK', '0'))
+    
+    # CPU inference mode
+    use_cpu = True
+    if use_cpu:
+        print("Running in CPU mode - this will be very slow!")
+        local_rank = "cpu"
+        global_rank = 0
+        num_processes = 1
+        cp_split_hw = [1, 1]  # No context parallelism on CPU
+        device = "cpu"
+        dtype = torch.float32  # CPU works better with float32
+    else:
+        num_gpus = torch.cuda.device_count()
+        local_rank = rank % num_gpus if num_gpus > 0 else 0
+        if num_gpus > 0:
+            torch.cuda.set_device(local_rank)
+        
+        # Use gloo backend for Windows compatibility
+        import platform
+        backend = "gloo" if platform.system() == "Windows" else "nccl"
+        dist.init_process_group(backend=backend, timeout=datetime.timedelta(seconds=3600*24))
+        global_rank    = dist.get_rank()
+        num_processes  = dist.get_world_size()
 
-    # initialize context parallel before loading models
-    init_context_parallel(context_parallel_size=context_parallel_size, global_rank=global_rank, world_size=num_processes)
-    cp_size = context_parallel_util.get_cp_size()
-    cp_split_hw = context_parallel_util.get_optimal_split(cp_size)
+        # initialize context parallel before loading models
+        init_context_parallel(context_parallel_size=context_parallel_size, global_rank=global_rank, world_size=num_processes)
+        cp_size = context_parallel_util.get_cp_size()
+        cp_split_hw = context_parallel_util.get_optimal_split(cp_size)
+        device = local_rank
+        dtype = torch.bfloat16
 
-    tokenizer = AutoTokenizer.from_pretrained(checkpoint_dir, subfolder="tokenizer", torch_dtype=torch.bfloat16)
-    text_encoder = UMT5EncoderModel.from_pretrained(checkpoint_dir, subfolder="text_encoder", torch_dtype=torch.bfloat16)
-    vae = AutoencoderKLWan.from_pretrained(checkpoint_dir, subfolder="vae", torch_dtype=torch.bfloat16)
-    scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(checkpoint_dir, subfolder="scheduler", torch_dtype=torch.bfloat16)
-    dit = LongCatVideoTransformer3DModel.from_pretrained(checkpoint_dir, subfolder="dit", cp_split_hw=cp_split_hw, torch_dtype=torch.bfloat16)
+    tokenizer = AutoTokenizer.from_pretrained(checkpoint_dir, subfolder="tokenizer", torch_dtype=dtype)
+    text_encoder = UMT5EncoderModel.from_pretrained(checkpoint_dir, subfolder="text_encoder", torch_dtype=dtype, low_cpu_mem_usage=True)
+    vae = AutoencoderKLWan.from_pretrained(checkpoint_dir, subfolder="vae", torch_dtype=dtype, low_cpu_mem_usage=True)
+    scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(checkpoint_dir, subfolder="scheduler", torch_dtype=dtype)
+    dit = LongCatVideoTransformer3DModel.from_pretrained(checkpoint_dir, subfolder="dit", cp_split_hw=cp_split_hw, torch_dtype=dtype, low_cpu_mem_usage=True)
 
-    if enable_compile:
+    # Disable compile for CPU inference
+    if enable_compile and not use_cpu:
         dit = torch.compile(dit)
 
     pipe = LongCatVideoPipeline(
@@ -64,30 +84,57 @@ def generate(args):
         scheduler = scheduler,
         dit = dit,
     )
-    pipe.to(local_rank)
+    pipe.to(device)
 
     global_seed = 42
     seed = global_seed + global_rank
 
-    generator = torch.Generator(device=local_rank)
+    generator = torch.Generator(device=device)
     generator.manual_seed(seed)
 
-    ### t2v (480p)
-    output = pipe.generate_t2v(
-        prompt=prompt,
-        negative_prompt=negative_prompt,
-        height=480,
-        width=832,
-        num_frames=93,
-        num_inference_steps=50,
-        guidance_scale=4.0,
-        generator=generator,
-    )[0]
+    ### t2v (480p) - simplified for CPU
+    print("Starting text-to-video generation (this will take a very long time on CPU)...")
+    print(f"Prompt: {prompt}")
+    
+    # Use smaller resolution and fewer frames for CPU
+    if use_cpu:
+        print("Using reduced parameters for CPU: 240x416, 45 frames, 10 steps")
+        output = pipe.generate_t2v(
+            prompt=prompt,
+            negative_prompt=negative_prompt,
+            height=240,  # Reduced from 480
+            width=416,   # Reduced from 832
+            num_frames=45,  # Reduced from 93
+            num_inference_steps=10,  # Reduced from 50
+            guidance_scale=4.0,
+            generator=generator,
+        )[0]
+    else:
+        output = pipe.generate_t2v(
+            prompt=prompt,
+            negative_prompt=negative_prompt,
+            height=480,
+            width=832,
+            num_frames=93,
+            num_inference_steps=50,
+            guidance_scale=4.0,
+            generator=generator,
+        )[0]
 
-    if local_rank == 0:
+    if use_cpu or local_rank == 0:
+        print("Saving video...")
         output_tensor = torch.from_numpy(np.array(output))
         output_tensor = (output_tensor * 255).clamp(0, 255).to(torch.uint8)
         write_video("output_t2v.mp4", output_tensor, fps=15, video_codec="libx264", options={"crf": f"{18}"})
+        print("Video saved as output_t2v.mp4")
+    
+    print("Generation complete!")
+    
+    # Skip distill and refinement stages on CPU to save time
+    if use_cpu:
+        print("Skipping distill and refinement stages on CPU to save time.")
+        return
+    
     del output
     torch_gc()
 

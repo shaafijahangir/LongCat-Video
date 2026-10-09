@@ -7,7 +7,10 @@ from einops import rearrange
 
 from .rope_3d import RotaryPositionalEmbedding
 from .blocks import RMSNorm_FP32
-from ..block_sparse_attention.bsa_interface import flash_attn_bsa_3d
+try:
+    from ..block_sparse_attention.bsa_interface import flash_attn_bsa_3d
+except ImportError:
+    flash_attn_bsa_3d = None
 from ..context_parallel.ulysses_wrapper import ulysses_wrapper
 
 
